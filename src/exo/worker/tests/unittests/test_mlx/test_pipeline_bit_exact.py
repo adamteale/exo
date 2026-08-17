@@ -66,6 +66,40 @@ MODEL_CONFIGS = {
             ),
         ),
     ),
+    # Hybrid linear/full attention (non-MoE) — Qwen3.8-27B arch. The qwen3_5_moe
+    # fixes above were never verified for this arch; reproducing here.
+    "qwen3_5": dict(
+        module="mlx_lm.models.qwen3_5",
+        args=dict(
+            model_type="qwen3_5",
+            text_config=dict(
+                model_type="qwen3_5",
+                vocab_size=512,
+                hidden_size=512,
+                intermediate_size=1024,
+                num_hidden_layers=4,
+                num_attention_heads=16,
+                num_key_value_heads=4,
+                head_dim=32,
+                max_position_embeddings=128,
+                rms_norm_eps=1e-6,
+                tie_word_embeddings=False,
+                attention_bias=False,
+                full_attention_interval=2,
+                linear_num_value_heads=32,
+                linear_num_key_heads=16,
+                linear_key_head_dim=32,
+                linear_value_head_dim=32,
+                linear_conv_kernel_dim=4,
+                rope_parameters={
+                    "type": "default",
+                    "rope_theta": 10000.0,
+                    "partial_rotary_factor": 0.25,
+                    "mrope_section": [11, 11, 10],
+                },
+            ),
+        ),
+    ),
 }
 
 
@@ -259,3 +293,10 @@ def _run_compare(name: str, world_size: int, port: int, steps: int):
 @pytest.mark.parametrize("steps", [1, 8])
 def test_pipeline_bit_exact_qwen3_5_moe(steps):
     _run_compare("qwen3_5_moe", world_size=2, port=32400 + steps, steps=steps)
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(os.sys.platform != "darwin", reason="MLX distributed requires Metal")
+@pytest.mark.parametrize("steps", [1, 8])
+def test_pipeline_bit_exact_qwen3_5(steps):
+    _run_compare("qwen3_5", world_size=2, port=32500 + steps, steps=steps)
