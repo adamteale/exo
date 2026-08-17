@@ -262,9 +262,12 @@ def _run_compare(name: str, world_size: int, port: int, steps: int):
             fn()
         return inner
 
-    # simpler: run workers sequentially in own processes with env set by target
-    for rank, p in enumerate(procs):
+    # Start ALL ranks simultaneously before joining — MLX distributed requires
+    # both ranks running to connect at the first send/recv. A sequential
+    # start-then-join per rank deadlocks (rank 0 waits for rank 1, not started).
+    for p in procs:
         p.start()
+    for p in procs:
         p.join(240)
     results = [q.get(timeout=300) for _ in range(world_size + 1)]
 
