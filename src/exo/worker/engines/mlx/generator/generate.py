@@ -340,7 +340,13 @@ def prefill(
 
     try:
         if is_pipeline and num_tokens >= prefill_step_size:
-            set_pipeline_queue_sends(model, queue_sends=True)
+            # FIX (exo Issue #2108): queue_sends=False. With queue_sends=True the
+            # send is appended to _pending_prefill_sends and submitted later via
+            # flush_prefill_sends (mx.async_eval), but the async send is never forced
+            # by any eval, so it is never actually submitted and the receiver's recv
+            # deadlocks. Submitting immediately (queue_sends=False) in the
+            # PipelineLastLayer (like the warmup path) makes the send/recv pair.
+            set_pipeline_queue_sends(model, queue_sends=False)
             assert group is not None, "Pipeline prefill requires a distributed group"
             pipeline_parallel_prefill(
                 model=model,
@@ -350,7 +356,14 @@ def prefill(
                 kv_group_size=KV_GROUP_SIZE,
                 kv_bits=KV_BITS,
                 prompt_progress_callback=progress_callback,
-                distributed_prompt_progress_callback=distributed_prompt_progress_callback,
+                # FIX (exo Issue #2108): skip the distributed callback during pipeline
+                # prefill. The callback's mx_any (all_sum) + mx_all_gather_tasks
+                # (all_gather) are collective ops that don't block for the delayed peer
+                # (the rank doing the real forward is ~8s behind the leading-dummy rank),
+                # so the leading rank's recv returns stale/garbage data and the forward
+                # rank's all_sum deadlocks. For single-request prefill (no cancellations,
+                # no new tasks) the callback is a no-op anyway (all counts are 0).
+                distributed_prompt_progress_callback=None,
                 group=group,
             )
         else:
