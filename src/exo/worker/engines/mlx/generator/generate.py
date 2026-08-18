@@ -331,7 +331,15 @@ def prefill(
 
     is_pipeline = _has_pipeline_communication_layer(model)
 
-    prefill_step_size = 4096
+    # WORKAROUND (exo Issue #2108): pipeline_parallel_prefill deadlocks for large
+    # contexts (>=4096) on multi-machine sharded models — the chunked ring send/recv
+    # in the pipeline loop desyncs even with queue_sends=False + the distributed
+    # callback skipped. The single-pass stream_generate path (below) does NOT
+    # deadlock (its decode all_gather is fixed to run on the CPU stream — see
+    # PipelineLastLayer in auto_parallel.py). Setting the threshold to 100000 means
+    # num_tokens >= prefill_step_size is effectively never true, so all prompts use
+    # stream_generate. This matches the verified-working 8K/16K/32K results.
+    prefill_step_size = 100000
 
     try:
         if is_pipeline and num_tokens >= prefill_step_size:
@@ -363,7 +371,17 @@ def prefill(
             )
         else:
             # Use max_tokens=1 because max_tokens=0 does not work.
-            # We just throw away the generated token - we only care about filling the cache
+            # We just throw away the generated token - we only care about filling the cache.
+            #
+            # WORKAROUND (exo Issue #2108): chunk the stream_generate prefill at 2048
+            # tokens (NOT the bypass threshold of 100000) so the peer's GPU doesn't OOM
+            # on large prompts. With prefill_step_size=100000 the entire prompt is
+            # processed in a single forward pass, which exhausts the 24GB peer's Metal
+            # memory at ~6K+ tokens ("kIOGPUCommandBufferCallbackErrorOutOfMemory").
+            # Chunking at 2048 processes the prompt in multiple smaller forward passes,
+            # each holding only 2048 tokens of activations. Each pass is an independent
+            # send/recv pair (unlike the broken pipeline_parallel_prefill loop, which
+            # deadlocks on the chunked ring send/recv).
             for _ in stream_generate(
                 model=model,
                 tokenizer=tokenizer,
@@ -371,7 +389,7 @@ def prefill(
                 max_tokens=1,
                 sampler=sampler,
                 prompt_cache=cache,
-                prefill_step_size=prefill_step_size,
+                prefill_step_size=2048,
                 kv_group_size=KV_GROUP_SIZE,
                 kv_bits=KV_BITS,
                 prompt_progress_callback=combined_progress_callback,
