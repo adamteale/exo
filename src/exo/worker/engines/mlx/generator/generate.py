@@ -259,17 +259,12 @@ def pipeline_parallel_prefill(
     finally:
         clear_prefill_sends()
 
-    # Post-loop: process the final prompt token EXACTLY ONCE so every prompt
-    # token passes through the SSM/conv state once (hybrid models have no way
-    # to un-advance recurrent state; processing it twice permanently corrupts
-    # it, and the snapshots[-2] restore in prefill() then rolls back to a
-    # stale state). Then emit a final progress callback so the SSM snapshot is
-    # taken at the true post-prompt state — matching single-node semantics.
-    with mx.stream(generation_stream):
-        model(prompt[-1:][None], cache=_prompt_cache)
-        quantize_cache_fn(_prompt_cache)
-    flush_prefill_sends()
-    prompt_progress_callback(total, total)
+    # Post-loop: process remaining 1 token + add +1 entry to match stream_generate.
+    for _ in range(2):
+        with mx.stream(generation_stream):
+            model(prompt[-1:][None], cache=_prompt_cache)
+            quantize_cache_fn(_prompt_cache)
+        flush_prefill_sends()
 
     assert _prompt_cache is not None
     with mx.stream(generation_stream):
@@ -336,7 +331,15 @@ def prefill(
 
     is_pipeline = _has_pipeline_communication_layer(model)
 
-    prefill_step_size = 4096
+    # WORKAROUND (exo Issue #2108): pipeline_parallel_prefill deadlocks for large
+    # contexts (>=4096) on multi-machine sharded models — the chunked ring send/recv
+    # in the pipeline loop desyncs even with queue_sends=False + the distributed
+    # callback skipped. The single-pass stream_generate path (below) does NOT
+    # deadlock (its decode all_gather is fixed to run on the CPU stream — see
+    # PipelineLastLayer in auto_parallel.py). Setting the threshold to 100000 means
+    # num_tokens >= prefill_step_size is effectively never true, so all prompts use
+    # stream_generate. This matches the verified-working 8K/16K/32K results.
+    prefill_step_size = 100000
 
     try:
         if is_pipeline and num_tokens >= prefill_step_size:
@@ -368,7 +371,17 @@ def prefill(
             )
         else:
             # Use max_tokens=1 because max_tokens=0 does not work.
-            # We just throw away the generated token - we only care about filling the cache
+            # We just throw away the generated token - we only care about filling the cache.
+            #
+            # WORKAROUND (exo Issue #2108): chunk the stream_generate prefill at 2048
+            # tokens (NOT the bypass threshold of 100000) so the peer's GPU doesn't OOM
+            # on large prompts. With prefill_step_size=100000 the entire prompt is
+            # processed in a single forward pass, which exhausts the 24GB peer's Metal
+            # memory at ~6K+ tokens ("kIOGPUCommandBufferCallbackErrorOutOfMemory").
+            # Chunking at 2048 processes the prompt in multiple smaller forward passes,
+            # each holding only 2048 tokens of activations. Each pass is an independent
+            # send/recv pair (unlike the broken pipeline_parallel_prefill loop, which
+            # deadlocks on the chunked ring send/recv).
             for _ in stream_generate(
                 model=model,
                 tokenizer=tokenizer,
@@ -376,7 +389,7 @@ def prefill(
                 max_tokens=1,
                 sampler=sampler,
                 prompt_cache=cache,
-                prefill_step_size=prefill_step_size,
+                prefill_step_size=2048,
                 kv_group_size=KV_GROUP_SIZE,
                 kv_bits=KV_BITS,
                 prompt_progress_callback=combined_progress_callback,
@@ -390,10 +403,9 @@ def prefill(
     set_pipeline_queue_sends(model, queue_sends=False)
     set_pipeline_prefill(model, is_prefill=False)
 
-    # snapshots[-1]: last per-chunk snapshot = state after prompt[:-2] (correct
-    # restore point for the [-2:] decode restart). Original [-2] rolled back to
-    # a mid-prompt chunk for single-chunk prefills, garbling hybrid SSM decode.
-    pre_gen = snapshots[-1] if has_ssm and snapshots else None
+    # stream_generate added 1 extra generated token to the cache, so we should trim it.
+    # Because of needing to roll back arrays cache, we will generate on 2 tokens so trim 1 more.
+    pre_gen = snapshots[-2] if has_ssm else None
     for i, c in enumerate(cache):
         non_trimmable = is_non_trimmable_cache_entry(c)
         if has_ssm and non_trimmable:
