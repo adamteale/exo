@@ -292,10 +292,19 @@ class RunnerSupervisor:
         Aborting...`` but does not crash the process — the in-flight collective
         hangs forever. Stopping the runner here lets the supervisor surface the
         failure + exo re-place the instance (re-initializing the ring).
+
+        We also clear the collected diagnostics before stopping, because the
+        ErrorChunk's ``diagnostics: list[KnownRunnerDiagnostic]`` field fails
+        pydantic validation for ``RunnerRingTransportError`` (the ``message`` field
+        is rejected as ``extra_forbidden`` on the receiving side — a pre-existing
+        TaggedModel serialization bug). Sending an empty diagnostics list avoids
+        the validation flood that would otherwise wedge the supervisor.
         """
         logger.error(
             f"Killing runner process due to fatal diagnostic: {line.strip()}"
         )
+        # Avoid the pydantic validation flood in ErrorChunk sending.
+        self._runner_stdio_handler.diagnostics._diagnostics.clear()
         with anyio.CancelScope(shield=True):
             await self.runner_process.stop()
 
