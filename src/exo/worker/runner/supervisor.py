@@ -68,6 +68,14 @@ class RunnerStdioHandler:
     diagnostics: RunnerDiagnosticCollector = field(
         default_factory=RunnerDiagnosticCollector
     )
+    # FIX (exo Issue #2108): when a fatal runner diagnostic is detected on stderr
+    # (e.g. the mlx ring transport aborting after too many send/recv errors), this
+    # callback is invoked so the supervisor can kill the runner process and let exo
+    # re-place the instance (re-initializing the distributed group / ring). Without
+    # this the runner hangs forever — the ring is dead but the process stays alive,
+    # so the diagnostics are never acted upon (only surfaced on runner termination).
+    on_fatal_diagnostic: Callable[[str], Awaitable[None]] | None = None
+    _fatal_triggered: bool = field(default=False, init=False)
 
     _tg: TaskGroup = field(default_factory=TaskGroup, init=False)
 
@@ -275,10 +283,19 @@ class RunnerSupervisor:
         Aborting...`` but does not crash the process — the in-flight collective
         hangs forever. Stopping the runner here lets the supervisor surface the
         failure + exo re-place the instance (re-initializing the ring).
+
+        We also clear the collected diagnostics before stopping, because the
+        ErrorChunk's ``diagnostics: list[KnownRunnerDiagnostic]`` field fails
+        pydantic validation for ``RunnerRingTransportError`` (the ``message`` field
+        is rejected as ``extra_forbidden`` on the receiving side — a pre-existing
+        TaggedModel serialization bug). Sending an empty diagnostics list avoids
+        the validation flood that would otherwise wedge the supervisor.
         """
         logger.error(
             f"Killing runner process due to fatal diagnostic: {line.strip()}"
         )
+        # Avoid the pydantic validation flood in ErrorChunk sending.
+        self._runner_stdio_handler.diagnostics._diagnostics.clear()
         with anyio.CancelScope(shield=True):
             await self.runner_process.stop()
 
